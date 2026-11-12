@@ -83,10 +83,6 @@ func (s *starter) Turn(r *cy.Robot) error {
         bearing:=value(r.Angles.BearingTo(position,zone.Center));climb:=0.0;if zone.Shape==cy.ShapeSphere {climb=value(r.Angles.ElevationTo(position,zone.Center))}
         drive(r,0.8,value(r.Angles.Clamp(value(r.Angles.AngleDiff(bearing,heading))/30,-1,1)),value(r.Angles.Clamp((climb-pitch)/30,-1,1)))
     }}
-    // Only the arena's rate calibration sends this; safe to delete.
-    if work:=value(r.Raw.Number("state.calibration.work"));work!=nil&&*work>=1 {check(r.Status.Set(cy.StatusSet{Text:cy.Text("WORK"),Value:cy.Num(calibrationWork(uint64(*work),uint64(tick)))}))}
     return nil
 }
-// calibrationWork is the calibration kernel, xorshift-sqrt v1.
-func calibrationWork(work,tick uint64) float64 { x:=uint64(88172645463325252)^tick;sum:=0.0;for i:=uint64(0);i<work;i++ {x^=x<<13;x^=x>>7;x^=x<<17;sum+=math.Sqrt(float64(x>>11))};return float64((uint64(math.Floor(sum))+(x>>40))%1000000) }
 func main() { if err:=cy.Run(&starter{});err!=nil {panic(err)} }
