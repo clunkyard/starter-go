@@ -1,5 +1,7 @@
 // A robot on the Clunkyard core's Go binding. The core owns tracking,
 // geometry and protocol handling; this strategy chooses the tactics.
+// It searches with a broad scan, narrows the beam on a contact, and leads
+// shots from a line through its recent sightings.
 // Clunkyard robot API 2.0.0: one core under every language, the same
 // answers everywhere. Facts (a call shows its arguments):
 // match: mode ruleset control robots is_3d tick_rate max_ticks
@@ -49,25 +51,85 @@ import (
     cy "clunkyard"
     "math"
 )
-type starter struct { freeFlight bool; dodgeTicks,dodges int }
+// Bearing is earned: a scan contact's bearing is off by up to its BearingError
+// (degrees, a fixed share of the arc), so a wide beam finds a robot and a narrow
+// one aims at it. Contacts within 120 units are exact.
+const (
+    searchArc=40.0  // degrees: sweeps the circle in half a second
+    holdWidth=60.0  // units across at the target: it stays in the beam from tick to tick
+    minArc=6.0      // degrees: the narrowest the beam holds
+    window=12       // ticks of sightings the aim averages
+    sightings=8     // narrow sightings in the window before a shot
+    lookEvery=40    // ticks between looks around the target, for a nearer robot
+    reacquire=10    // ticks to look again where a lost target was
+)
+type starter struct { freeFlight bool; dodgeTicks,dodges int; slot int32 }
 func value[T any](out T, err error) T { if err != nil { panic(err) }; return out }
 func check(err error) { if err != nil { panic(err) } }
 func steer(r *cy.Robot, towards, current float64) float64 { return value(r.Angles.Clamp(value(r.Angles.AngleDiff(towards,current))/45,-1,1)) }
 func drive(r *cy.Robot,throttle,turn,pitch float64) { check(r.Drive.Set(cy.DriveSet{Throttle:cy.Num(throttle),Turn:cy.Num(turn),PitchTurn:cy.Num(pitch)})) }
 func scan(r *cy.Robot,heading,arc,pitch float64) { check(r.Scanner.Set(cy.ScannerSet{Heading:cy.Num(heading),Arc:cy.Num(arc),Pitch:cy.Num(pitch)})) }
+// fit is a straight line through the narrowest of the last window ticks'
+// sightings: where the robot is now and how fast it moves. Each sighting is off
+// by its BearingError; the line averages that out.
+func fit(r *cy.Robot,slot,tick int32) (position,velocity cy.Vec3,count int) {
+    best:=math.Inf(1);recent:=[]cy.Sighting{}
+    for _,s:=range value(r.Tracker.History(slot)) {if s.Tick>tick-window {recent=append(recent,s);best=math.Min(best,s.BearingError)}}
+    if len(recent)<2 {return}
+    seen:=[]cy.Sighting{};for _,s:=range recent {if s.BearingError<=1.5*best {seen=append(seen,s)}}
+    if len(seen)<2 {return}
+    n:=float64(len(seen));t0,spread:=0.0,0.0
+    for _,s:=range seen {t0+=float64(s.Tick)/n}
+    for _,s:=range seen {spread+=(float64(s.Tick)-t0)*(float64(s.Tick)-t0)}
+    rate:=float64(value(r.Match.TickRate()))
+    // Least squares on one axis: its fitted position now and its speed per second.
+    line:=func(axis func(cy.Vec3) float64) (now,speed float64) {
+        mean,along:=0.0,0.0
+        for _,s:=range seen {mean+=axis(s.Position)/n}
+        for _,s:=range seen {along+=(float64(s.Tick)-t0)*(axis(s.Position)-mean)}
+        slope:=along/spread;return mean+slope*(float64(tick)-t0),slope*rate
+    }
+    position.X,velocity.X=line(func(v cy.Vec3) float64 {return v.X})
+    position.Y,velocity.Y=line(func(v cy.Vec3) float64 {return v.Y})
+    position.Z,velocity.Z=line(func(v cy.Vec3) float64 {return v.Z})
+    return position,velocity,len(seen)
+}
 func (s *starter) Start(r *cy.Robot) error { s.freeFlight=value(r.Match.Is3d())&&value(r.Arena.Gravity()).Z==0; return nil }
 func (s *starter) Turn(r *cy.Robot) error {
     position,heading,pitch,tick:=value(r.Me.Position()),value(r.Me.Heading()),value(r.Me.Pitch()),value(r.Clock.Tick())
     check(r.Drive.Forces(cy.DriveForces{Brake:cy.Num(0.2)}))
+    var lastSeen *int32;if s.slot!=0 {lastSeen=value(r.Tracker.LastSeen(s.slot))}
     if target:=value(r.Sensors.Nearest());target!=nil {
+        s.slot=target.Slot
         throttle:=0.2;if target.Range>350 {throttle=0.7} else if target.Range<200 {throttle=-0.4}
-        drive(r,throttle,steer(r,target.Bearing,heading),steer(r,target.Elevation,pitch));scan(r,target.Bearing,20,target.Elevation)
-        // Gun.Lead is the intercept if the target holds course.
-        power:=value(r.Gun.PowerForFlightTime(target.Range,1));aim:=value(r.Gun.Lead(*target,power))
+        drive(r,throttle,steer(r,target.Bearing,heading),steer(r,target.Elevation,pitch))
+        // Halve the beam each tick until it is holdWidth across at the target:
+        // narrow enough for a precise bearing, wide enough to keep it in.
+        hold:=math.Max(minArc,2*math.Atan2(holdWidth/2,target.Range)*180/math.Pi)
+        // In a crowd a narrow beam sees one robot. Every lookEvery ticks, widen it
+        // for a tick: a nearer robot it finds becomes the target.
+        arc:=math.Max(hold,math.Min(searchArc,value(r.Scanner.Last()).Arc/2));if tick%lookEvery==0 {arc=searchArc}
+        scan(r,target.Bearing,arc,target.Elevation)
+        power:=value(r.Gun.PowerForFlightTime(target.Range,1))
+        // An exact contact: Gun.Lead is the intercept if the target holds course.
+        // A noisy one: lead the fitted line, and fire only once it rests on enough sightings.
+        var aim *cy.Solution;ready:=true
+        if target.BearingError>0 {
+            position,velocity,count:=fit(r,target.Slot,tick)
+            if count>0 {aim=value(r.Gun.LeadPoint(position,velocity,power))}
+            ready=aim!=nil&&count>=sightings
+        } else {aim=value(r.Gun.Lead(*target,power))}
         towards,up:=target.Bearing,target.Elevation;if aim!=nil {towards,up=aim.Heading,aim.Pitch}
         check(r.Gun.Aim(cy.GunAim{Heading:cy.Num(towards),Pitch:cy.Num(up)}));now:=value(r.Gun.AimNow())
-        if math.Abs(value(r.Angles.AngleDiff(towards,now.Heading)))<3&&math.Abs(up-now.Pitch)<3&&value(r.Gun.CanFire(power,10)) {check(r.Gun.Fire(cy.GunFire{Power:cy.Num(power)}))}
-        check(r.Status.Set(cy.StatusSet{Text:cy.Text("TRACK"),Value:cy.Num(target.Range)}))
+        if ready&&math.Abs(value(r.Angles.AngleDiff(towards,now.Heading)))<3&&math.Abs(up-now.Pitch)<3&&value(r.Gun.CanFire(power,10)) {check(r.Gun.Fire(cy.GunFire{Power:cy.Num(power)}))}
+        text:="NARROW";if ready {text="TRACK"}
+        check(r.Status.Set(cy.StatusSet{Text:cy.Text(text),Value:cy.Num(target.Range)}))
+    } else if lastSeen!=nil&&tick-*lastSeen<=reacquire {
+        // Lost it: look again where it was last seen, widening the beam, before searching.
+        where:=value(r.Tracker.Position(s.slot));bearing:=value(r.Angles.BearingTo(position,*where));elevation:=0.0
+        if s.freeFlight {elevation=value(r.Angles.ElevationTo(position,*where))}
+        drive(r,0.5,steer(r,bearing,heading),steer(r,elevation,pitch));scan(r,bearing,math.Min(searchArc,value(r.Scanner.Last()).Arc*2),elevation)
+        check(r.Status.Set(cy.StatusSet{Text:cy.Text("REACQUIRE")}))
     } else if cue:=value(r.Tracker.Cue());cue!=nil {
         bearing,distance:=value(r.Angles.BearingTo(position,cue.Position)),value(r.Angles.Distance(position,cue.Position))
         elevation:=0.0;if s.freeFlight {elevation=value(r.Angles.ElevationTo(position,cue.Position))}
@@ -76,7 +138,7 @@ func (s *starter) Turn(r *cy.Robot) error {
         check(r.Status.Set(cy.StatusSet{Text:cy.Text("CUE"),Value:cy.Num(distance)}))
     } else {
         drive(r,0.5,0.33,steer(r,0,pitch));up:=0.0;if s.freeFlight {up=float64((tick/10)%3-1)*35}
-        scan(r,value(r.Angles.Normalize(value(r.Scanner.Last()).Heading+36)),40,up);check(r.Status.Set(cy.StatusSet{Text:cy.Text("SEARCH")}))
+        scan(r,value(r.Angles.Normalize(value(r.Scanner.Last()).Heading+36)),searchArc,up);check(r.Status.Set(cy.StatusSet{Text:cy.Text("SEARCH")}))
     }
     // A simple dodge: vary it, or predict the shooter.
     fired:=false;for _,heard:=range value(r.Sensors.Cues()) {fired=fired||heard.Source==cy.SourceMuzzle}
