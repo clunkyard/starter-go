@@ -7,7 +7,8 @@
 // clock: tick seconds remaining_ticks
 // arena: size gravity terrain_kind ground_height(x y)
 // me: health position velocity heading pitch roll angular_velocity
-//   attitude grounded altitude applied
+//   attitude grounded altitude applied hull_mounts to_mount(heading pitch)
+//   from_mount(heading pitch) mount_toward(point)
 // battery: charge capacity regen sustainable_drive compute
 //   drive_cost(fraction)
 // drive: hover_lift
@@ -29,7 +30,8 @@
 // score: me best armour
 // angles: normalize(degrees) angle_diff(target current)
 //   bearing_to(from to) elevation_to(from to) direction(heading pitch)
-//   distance(a b) clamp(value low high)
+//   distance(a b) to_chassis(heading pitch attitude)
+//   from_chassis(heading pitch attitude) clamp(value low high)
 // raw: number(path) text(path) has(path) flag(path) count(path) line()
 // Controls: drive.set(throttle turn pitch_turn)
 //   drive.forces(thrust strafe lift yaw_torque pitch_torque roll_torque brake)
@@ -47,7 +49,7 @@ import (
     cy "clunkyard"
     "math"
 )
-type starter struct { freeFlight bool }
+type starter struct { freeFlight bool; dodgeTicks,dodges int }
 func value[T any](out T, err error) T { if err != nil { panic(err) }; return out }
 func check(err error) { if err != nil { panic(err) } }
 func steer(r *cy.Robot, towards, current float64) float64 { return value(r.Angles.Clamp(value(r.Angles.AngleDiff(towards,current))/45,-1,1)) }
@@ -60,6 +62,7 @@ func (s *starter) Turn(r *cy.Robot) error {
     if target:=value(r.Sensors.Nearest());target!=nil {
         throttle:=0.2;if target.Range>350 {throttle=0.7} else if target.Range<200 {throttle=-0.4}
         drive(r,throttle,steer(r,target.Bearing,heading),steer(r,target.Elevation,pitch));scan(r,target.Bearing,20,target.Elevation)
+        // Gun.Lead is the intercept if the target holds course.
         power:=value(r.Gun.PowerForFlightTime(target.Range,1));aim:=value(r.Gun.Lead(*target,power))
         towards,up:=target.Bearing,target.Elevation;if aim!=nil {towards,up=aim.Heading,aim.Pitch}
         check(r.Gun.Aim(cy.GunAim{Heading:cy.Num(towards),Pitch:cy.Num(up)}));now:=value(r.Gun.AimNow())
@@ -74,6 +77,17 @@ func (s *starter) Turn(r *cy.Robot) error {
     } else {
         drive(r,0.5,0.33,steer(r,0,pitch));up:=0.0;if s.freeFlight {up=float64((tick/10)%3-1)*35}
         scan(r,value(r.Angles.Normalize(value(r.Scanner.Last()).Heading+36)),40,up);check(r.Status.Set(cy.StatusSet{Text:cy.Text("SEARCH")}))
+    }
+    // A simple dodge: vary it, or predict the shooter.
+    fired:=false;for _,heard:=range value(r.Sensors.Cues()) {fired=fired||heard.Source==cy.SourceMuzzle}
+    if s.dodgeTicks==0&&fired {s.dodges++;s.dodgeTicks=10}
+    if s.dodgeTicks>0 {
+        // Odd dodges go left, even ones right; turn +1 and strafe -1 go left.
+        left:=s.dodges%2==1;side,text:=-1.0,"dodge:right";if left {side,text=1,"dodge:left"};s.dodgeTicks--
+        if value(r.Match.Control())==cy.ControlForces {
+            check(r.Drive.Set(cy.DriveSet{Throttle:cy.Num(0.5)}));check(r.Drive.Forces(cy.DriveForces{Strafe:cy.Num(-side)}))
+        } else {check(r.Drive.Set(cy.DriveSet{Throttle:cy.Num(1),Turn:cy.Num(side)}))}
+        check(r.Status.Set(cy.StatusSet{Text:cy.Text(text),Value:cy.Num(float64(s.dodges))}))
     }
     if value(r.Battery.Charge())<value(r.Battery.Capacity())/4 {if throttle:=value(r.Drive.GetThrottle());throttle!=nil {check(r.Drive.Set(cy.DriveSet{Throttle:cy.Num(*throttle*0.5)}))}}
     if storm:=value(r.Nav.Storm());storm!=nil {if margin:=value(storm.Margin(position));margin!=nil&&*margin>-60 {
